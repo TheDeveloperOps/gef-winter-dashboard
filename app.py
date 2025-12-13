@@ -1,260 +1,302 @@
-# app2.py
 """
-Single-file Flask app (patched)
-- Reads Google Sheet or local Excel fallback.
-- Uses 'Name' column as athlete display name (prefers it over '/athletes/...' path).
-- Search filters by name and athlete id.
-- Leaderboards have internal scroll boxes and sticky headers.
-- Configure START DATE by env CHALLENGE_START (YYYY-MM-DD).
-- Configure auto-refresh via AUTO_REFRESH_SECONDS env var (default 300).
+GEF Winter Challenge Dashboard - Simplified
+- Searchable individual scores
+- Team performance bar chart
 """
 
 import os
 import pytz
 import json
 import logging
-from datetime import datetime, timedelta, date
-import pytz
+from datetime import datetime
 import pandas as pd
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 from google.oauth2 import service_account
 import gspread
 
 # Config
 SHEET_ID = os.environ.get(
     'SHEET_ID', '1PF9liQPShcqMPNBScmV1_V3kUFaZcmlIHy8TLM4AmJc')
-LOCAL_XLSX_FALLBACK = '/mnt/data/GEF WINTER CHALLENGE.xlsx'
-START_DATE_ENV = os.environ.get('CHALLENGE_START')
-if START_DATE_ENV:
-    try:
-        START_DATE = datetime.strptime(START_DATE_ENV, '%Y-%m-%d').date()
-    except Exception:
-        START_DATE = date(2025, 11, 18)
-else:
-    START_DATE = date(2025, 11, 18)
-
 TIMEZONE = os.environ.get('TIMEZONE', 'Asia/Kolkata')
 AUTO_REFRESH_SECONDS = int(os.environ.get('AUTO_REFRESH_SECONDS', '300'))
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('gef_dashboard')
 
 app = Flask(__name__)
 
-# Safe template without f-string braces interfering with JS: insert interval later using .replace
 TEMPLATE = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Green Energy Fitness - Winter Challenge Tracker</title>
+  <title>GEF Winter Challenge</title>
   <style>
-    html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial}
-    body{background:linear-gradient(135deg,#051622,#08323d);color:#e6f7ee;padding:20px}
+    *{margin:0;padding:0;box-sizing:border-box}
+    html,body{height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto}
+    body{background:linear-gradient(135deg,#0f172a,#1e293b);color:#e2e8f0;padding:20px}
     .container{max-width:1200px;margin:0 auto}
-    .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:14px;padding:18px;margin:10px;box-shadow:0 12px 30px rgba(2,6,23,0.6)}
-    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
-    .stat{padding:12px;border-radius:12px}
-    .title{font-weight:700;font-size:18px;margin-bottom:6px;color:#c7f7da}
-    .big{font-size:28px;font-weight:800}
-    .leaderboard{
-      margin-top:12px;
-      max-height:360px;
-      overflow:auto;
-      padding-right:6px;
+    .header{text-align:center;margin-bottom:30px}
+    h1{font-size:28px;font-weight:800;background:linear-gradient(90deg,#10b981,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}
+    .card{background:rgba(30,41,59,0.6);backdrop-filter:blur(10px);border:1px solid rgba(148,163,184,0.1);border-radius:12px;padding:24px;margin:20px 0;box-shadow:0 10px 40px rgba(0,0,0,0.3)}
+    .section-title{font-size:20px;font-weight:700;color:#10b981;margin-bottom:16px;padding-bottom:8px;border-bottom:2px solid rgba(16,185,129,0.3);display:flex;align-items:center;gap:10px}
+    .chart-container{background:rgba(15,23,42,0.6);padding:20px;border-radius:10px;margin-top:16px;min-height:400px}
+    canvas{max-height:380px}
+    
+    /* Search Section */
+    .search-container{max-width:600px;margin:0 auto 30px;position:relative}
+    .search-wrapper{position:relative}
+    .search-box{width:100%;padding:16px 50px 16px 20px;font-size:16px;background:rgba(15,23,42,0.8);border:2px solid rgba(16,185,129,0.3);border-radius:10px;color:#e2e8f0;outline:none;transition:all 0.3s}
+    .search-box:focus{border-color:#10b981;box-shadow:0 0 20px rgba(16,185,129,0.3)}
+    .search-box::placeholder{color:#64748b}
+    .clear-btn{position:absolute;right:12px;top:50%;transform:translateY(-50%);background:rgba(239,68,68,0.8);color:white;border:none;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600;transition:all 0.2s;display:none}
+    .clear-btn:hover{background:rgba(239,68,68,1);transform:translateY(-50%) scale(1.05)}
+    .clear-btn.visible{display:block}
+    
+    .result-card{background:linear-gradient(135deg,rgba(16,185,129,0.15),rgba(59,130,246,0.15));border:2px solid rgba(16,185,129,0.3);border-radius:10px;padding:24px;margin-top:20px;text-align:center}
+    .result-name{font-size:24px;font-weight:700;color:#10b981;margin-bottom:12px}
+    .team-tag{display:inline-block;background:linear-gradient(135deg,#3b82f6,#2563eb);color:white;padding:6px 16px;border-radius:20px;font-size:13px;font-weight:700;margin-bottom:16px;letter-spacing:0.5px}
+    .result-points{font-size:48px;font-weight:800;color:#3b82f6;margin-bottom:8px}
+    .result-label{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:1px}
+    
+    .no-result{color:#94a3b8;text-align:center;padding:30px;font-size:14px}
+    .suggestions{margin-top:16px;max-height:200px;overflow-y:auto;background:rgba(15,23,42,0.95);border:1px solid rgba(148,163,184,0.2);border-radius:8px;display:none}
+    .suggestion-item{padding:12px 16px;cursor:pointer;border-bottom:1px solid rgba(148,163,184,0.1);transition:background 0.2s}
+    .suggestion-item:hover{background:rgba(16,185,129,0.2)}
+    .suggestion-item:last-child{border-bottom:none}
+    
+    .refresh-btn{position:fixed;right:20px;bottom:20px;background:linear-gradient(135deg,#10b981,#059669);color:white;border:none;padding:16px;border-radius:50%;box-shadow:0 8px 24px rgba(16,185,129,0.4);cursor:pointer;font-size:20px;transition:transform 0.2s;z-index:1000}
+    .refresh-btn:hover{transform:scale(1.1)}
+    
+    @media(max-width:768px){
+      body{padding:12px}
+      h1{font-size:22px}
+      .card{padding:16px}
+      .section-title{font-size:16px}
+      .result-points{font-size:36px}
+      .chart-container{min-height:300px;padding:12px}
+      canvas{max-height:280px}
     }
-    table{width:100%;border-collapse:collapse}
-    thead th{
-      position:sticky;
-      top:0;
-      background:rgba(2,6,23,0.6);
-      z-index:2;
-      padding:10px;
-      color:#d9fff0;
-    }
-    th,td{padding:10px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.03)}
-    th{font-weight:700}
-    .pos1{background:linear-gradient(90deg,rgba(255,255,255,0.03),transparent);}
-    .pos2{background:linear-gradient(90deg,rgba(255,255,255,0.02),transparent);}
-    .pos3{background:linear-gradient(90deg,rgba(255,255,255,0.015),transparent);}
-    .header-total{background:linear-gradient(90deg,#16a34a,#059669);border-radius:8px;padding:8px;color:white}
-    .header-walk{background:linear-gradient(90deg,#10b981,#059669);border-radius:8px;padding:8px;color:white}
-    .header-run{background:linear-gradient(90deg,#34d399,#059669);border-radius:8px;padding:8px;color:white}
-    .header-ride{background:linear-gradient(90deg,#6ee7b7,#10b981);border-radius:8px;padding:8px;color:white}
-    .header-consistent{background:linear-gradient(90deg,#86efac,#4ade80);border-radius:8px;padding:8px;color:#052e19}
-    .badge{background:#052e19;color:#dfffe3;padding:4px 8px;border-radius:999px;font-weight:700;font-size:12px}
-    .search{width:100%;padding:12px;border-radius:12px;border:0;margin-bottom:12px}
-    .refresh-btn{position:fixed;right:20px;bottom:20px;background:#10b981;color:white;border:none;padding:14px;border-radius:999px;box-shadow:0 12px 30px rgba(16,185,129,0.18);cursor:pointer}
-    .corner-day{position:fixed;right:26px;top:26px;background:linear-gradient(90deg,#34d399,#10b981);padding:18px;border-radius:12px;color:#053018;font-weight:800;box-shadow:0 10px 30px rgba(3,7,18,0.6);font-size:20px}
-    .small{font-size:12px;color:#bfead0}
-    @media (max-width:900px){.grid{grid-template-columns:1fr}}
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
 </head>
 <body>
   <div class="container">
-    <h1 style="font-size:26px;margin:6px 0 12px">Green Energy Fitness — Winter Challenge</h1>
+    <div class="header">
+      <h1>🏃 GEF Winter Challenge</h1>
+      <p style="color:#94a3b8;font-size:14px">Team Performance & Individual Scores</p>
+    </div>
 
+    <!-- Team Performance Chart -->
     <div class="card">
-      <input id="search" class="search" placeholder="Search athlete by name or ID..." oninput="applySearch()">
-      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-        <div class="stat card" style="flex:1">
-          <div class="title">Total Athletes</div>
-          <div id="total-athletes" class="big">—</div>
-        </div>
-        <div class="stat card" style="flex:1">
-          <div class="title">Days Running</div>
-          <div id="days-running" class="big">—</div>
-        </div>
-        <div class="stat card" style="flex:1">
-          <div class="title">Consistent Performers</div>
-          <div id="consistent-count" class="big">—</div>
-        </div>
-        <div class="stat card" style="flex:1">
-          <div class="title">Top Distance</div>
-          <div id="top-distance" class="big">— km</div>
-        </div>
+      <div class="section-title">
+        <span>🏆</span>
+        <span>Team Points - Bar Chart</span>
+      </div>
+      <div class="chart-container">
+        <canvas id="teamChart"></canvas>
       </div>
     </div>
 
-    <div class="grid">
-      <div class="card">
-        <div class="header-total">Top Total Distance</div>
-        <div id="leader-total" class="leaderboard"></div>
+    <!-- Search Section -->
+    <div class="card">
+      <div class="section-title">
+        <span>🔍</span>
+        <span>Search Your Score</span>
       </div>
-
-      <div class="card">
-        <div class="header-walk">Top Walkers (KM)</div>
-        <div id="leader-walk" class="leaderboard"></div>
-      </div>
-
-      <div class="card">
-        <div class="header-run">Top Runners (KM)</div>
-        <div id="leader-run" class="leaderboard"></div>
-      </div>
-
-      <div class="card">
-        <div class="header-ride">Top Riders (KM)</div>
-        <div id="leader-ride" class="leaderboard"></div>
-      </div>
-
-      <div class="card" style="grid-column:1 / -1">
-        <div class="header-consistent">ALL DAY PERFORMERS (Consistent)</div>
-        <div id="leader-consistent" class="leaderboard"></div>
+      <div class="search-container">
+        <div class="search-wrapper">
+          <input 
+            type="text" 
+            id="searchBox" 
+            class="search-box" 
+            placeholder="Type your name to search..."
+            autocomplete="off"
+          >
+          <button id="clearBtn" class="clear-btn">✕ Clear</button>
+        </div>
+        <div id="suggestions" class="suggestions"></div>
+        <div id="searchResult"></div>
       </div>
     </div>
 
-    <div style="margin-top:12px;font-size:12px;color:#bfead0">Last loaded: <span id="last-loaded">—</span></div>
+    <div style="margin-top:30px;text-align:center;color:#64748b;font-size:12px">
+      Last updated: <span id="lastUpdated">—</span>
+    </div>
   </div>
 
-  <div id="day-corner" class="corner-day">—</div>
-
-  <button class="refresh-btn" onclick="manualRefresh()">⟳</button>
+  <button class="refresh-btn" onclick="loadData()">⟳</button>
 
   <script>
-    let dataCache = null;
-    async function fetchData(){
+    let teamChartInstance = null;
+    let allAthletes = [];
+
+    async function loadData(){
       try{
         const res = await fetch('/api/data');
-        const json = await res.json();
-        dataCache = json;
-        render(json);
-      } catch(e){
-        console.error(e);
-        alert('Failed to load data. Check console for details.');
+        const data = await res.json();
+        
+        allAthletes = data.athletes;
+        renderTeamChart(data.teams);
+        
+        document.getElementById('lastUpdated').textContent = new Date(data.loaded_at).toLocaleString();
+      }catch(e){
+        console.error('Failed to load data:', e);
       }
     }
 
-    function cleanDisplayName(raw){
-      if(!raw) return '';
-      // remove leading /athletes/ or similar path segments, then trim
-      return raw.toString().replace(/^\\/*athletes\\/*/i, '').trim();
-    }
+    function renderTeamChart(teams){
+      const ctx = document.getElementById('teamChart').getContext('2d');
+      
+      const sorted = [...teams].sort((a,b) => b.points - a.points);
+      const labels = sorted.map(t => t.team);
+      const points = sorted.map(t => t.points);
 
-    function render(json){
-      document.getElementById('total-athletes').innerText = json.summary.total_athletes;
-      document.getElementById('days-running').innerText = json.summary.days_running;
-      document.getElementById('consistent-count').innerText = json.summary.consistent_count;
-      document.getElementById('top-distance').innerText = json.summary.top_distance_km.toFixed(2) + ' km';
-      document.getElementById('last-loaded').innerText = new Date(json.loaded_at).toLocaleString();
+      if(teamChartInstance) teamChartInstance.destroy();
 
-      const n = json.summary.days_running;
-      const suffix = (n%10===1 && n%100!==11)?'st':(n%10===2 && n%100!==12)?'nd':(n%10===3 && n%100!==13)?'rd':'th';
-      document.getElementById('day-corner').innerText = `${n}${suffix} day of challenge`;
-
-      renderLeaderboard('leader-total', json.leaderboards.total, true);
-      renderLeaderboard('leader-walk', json.leaderboards.walk, false, 'walk_km');
-      renderLeaderboard('leader-run', json.leaderboards.run, false, 'run_km');
-      renderLeaderboard('leader-ride', json.leaderboards.ride, false, 'ride_km');
-      renderConsistent('leader-consistent', json.consistent);
-    }
-
-    function renderLeaderboard(containerId, list, showId=false, kmField='km'){
-      const el = document.getElementById(containerId);
-      if(!list || list.length===0){ el.innerHTML = '<div class="small">No data</div>'; return }
-      const rows = ['<table><thead><tr><th>#</th><th>Name</th>' + (showId?'<th>Athlete ID</th>':'') + '<th>KM</th></tr></thead><tbody>'];
-      list.slice(0,50).forEach((r, i)=>{
-        const posClass = i===0? 'pos1' : (i===1? 'pos2' : (i===2? 'pos3':''));
-        const displayName = cleanDisplayName(r.name || r.athlete_id || '');
-        const athleteId = r.athlete_id || '';
-        const kmVal = (r[kmField]!==undefined)? r[kmField] : r.km;
-        const consistentTag = (r.consistent)? '<span class="badge">ALL DAY</span>' : '';
-        rows.push(`<tr class="${posClass}"><td>${i+1}</td><td>${displayName} ${consistentTag}</td>` + (showId?`<td>${athleteId}</td>`:'') + `<td>${(kmVal||0).toFixed(2)}</td></tr>`);
+      teamChartInstance = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: 'Points',
+            data: points,
+            backgroundColor: 'rgba(16, 185, 129, 0.8)',
+            borderColor: 'rgba(16, 185, 129, 1)',
+            borderWidth: 2
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: true,
+          plugins: {
+            legend: {display: false},
+            tooltip: {
+              callbacks: {
+                label: (ctx) => `${ctx.parsed.y.toFixed(1)} points`
+              }
+            },
+            datalabels: {
+              display: true,
+              anchor: 'center',
+              align: 'center',
+              rotation: -90,
+              color: 'white',
+              font: {
+                weight: 'bold',
+                size: window.innerWidth < 768 ? 11 : 14
+              },
+              formatter: (value) => value.toFixed(1)
+            }
+          },
+          scales: {
+            x: {
+              ticks: {
+                color: '#94a3b8',
+                font: {size: window.innerWidth < 768 ? 11 : 14, weight: 'bold'}
+              },
+              grid: {display: false}
+            },
+            y: {
+              title: {display: true, text: 'Points', color: '#94a3b8', font: {size: 13}},
+              ticks: {color: '#94a3b8', font: {size: 12}},
+              grid: {color: 'rgba(148,163,184,0.1)'}
+            }
+          }
+        }
       });
-      rows.push('</tbody></table>');
-      el.innerHTML = rows.join('');
     }
 
-    function renderConsistent(containerId, list){
-      const el = document.getElementById(containerId);
-      if(!list || list.length===0){ el.innerHTML = '<div class="small">No consistent performers yet</div>'; return }
-      const rows = ['<table><thead><tr><th>#</th><th>Name</th><th>Athlete ID</th><th>Badge</th></tr></thead><tbody>'];
-      list.forEach((r,i)=>{
-        const displayName = cleanDisplayName(r.name || r.athlete_id || '');
-        rows.push(`<tr class="${i===0?'pos1':''}"><td>${i+1}</td><td>${displayName}</td><td>${r.athlete_id}</td><td><span class="badge">ALL DAY PERFORMER</span></td></tr>`);
-      });
-      rows.push('</tbody></table>');
-      el.innerHTML = rows.join('');
+    // Search functionality
+    const searchBox = document.getElementById('searchBox');
+    const clearBtn = document.getElementById('clearBtn');
+    const suggestionsDiv = document.getElementById('suggestions');
+    const resultDiv = document.getElementById('searchResult');
+
+    searchBox.addEventListener('input', (e) => {
+      const query = e.target.value.trim().toLowerCase();
+      
+      // Show/hide clear button
+      if(query.length > 0){
+        clearBtn.classList.add('visible');
+      }else{
+        clearBtn.classList.remove('visible');
+      }
+      
+      if(query.length === 0){
+        suggestionsDiv.style.display = 'none';
+        suggestionsDiv.innerHTML = '';
+        resultDiv.innerHTML = '';
+        return;
+      }
+
+      const matches = allAthletes.filter(a => 
+        a.name.toLowerCase().includes(query)
+      ).slice(0, 10);
+
+      if(matches.length > 0){
+        suggestionsDiv.style.display = 'block';
+        suggestionsDiv.innerHTML = matches.map(a => 
+          `<div class="suggestion-item" onclick="selectAthlete('${a.athlete_id}')">
+            ${a.name} - ${a.team}
+          </div>`
+        ).join('');
+      }else{
+        suggestionsDiv.style.display = 'none';
+      }
+
+      if(matches.length === 1 || (matches.length > 0 && matches[0].name.toLowerCase() === query)){
+        selectAthlete(matches[0].athlete_id);
+      }
+    });
+
+    // Clear button functionality
+    clearBtn.addEventListener('click', () => {
+      searchBox.value = '';
+      clearBtn.classList.remove('visible');
+      suggestionsDiv.style.display = 'none';
+      suggestionsDiv.innerHTML = '';
+      resultDiv.innerHTML = '';
+      searchBox.focus();
+    });
+
+    function selectAthlete(athleteId){
+      const athlete = allAthletes.find(a => a.athlete_id === athleteId);
+      if(!athlete){
+        resultDiv.innerHTML = '<div class="no-result">Athlete not found</div>';
+        return;
+      }
+
+      searchBox.value = athlete.name;
+      suggestionsDiv.style.display = 'none';
+      clearBtn.classList.add('visible');
+      
+      resultDiv.innerHTML = `
+        <div class="result-card">
+          <div class="result-name">${athlete.name}</div>
+          <div class="team-tag">${athlete.team}</div>
+          <div class="result-points">${athlete.points.toFixed(1)}</div>
+          <div class="result-label">Total Points</div>
+        </div>
+      `;
     }
 
-    function applySearch(){
-      const q = document.getElementById('search').value.toLowerCase().trim();
-      if(!dataCache) return;
-      if(!q){ render(dataCache); return }
-      // filter leaderboards by cleaned display name or athlete id
-      const filtered = JSON.parse(JSON.stringify(dataCache));
-      Object.keys(filtered.leaderboards).forEach(key=>{
-        filtered.leaderboards[key] = filtered.leaderboards[key].filter(r => {
-          const displayName = (r.name || r.athlete_id || '').toString().toLowerCase().replace(/^\\/?athletes\\/?/,'').trim();
-          const id = (r.athlete_id || '').toString().toLowerCase();
-          return displayName.includes(q) || id.includes(q);
-        });
-      });
-      filtered.consistent = filtered.consistent.filter(r => {
-        const displayName = (r.name || r.athlete_id || '').toString().toLowerCase().replace(/^\\/?athletes\\/?/,'').trim();
-        const id = (r.athlete_id || '').toString().toLowerCase();
-        return displayName.includes(q) || id.includes(q);
-      });
-      render(filtered);
-    }
+    // Hide suggestions when clicking outside
+    document.addEventListener('click', (e) => {
+      if(!searchBox.contains(e.target) && !suggestionsDiv.contains(e.target)){
+        suggestionsDiv.style.display = 'none';
+      }
+    });
 
-    function manualRefresh(){ fetchData(); }
-
-    // auto refresh (in milliseconds)
-    fetchData();
-    setInterval(fetchData, AUTO_REFRESH_INTERVAL);
+    loadData();
+    setInterval(loadData, AUTO_REFRESH_INTERVAL);
   </script>
 </body>
 </html>
-"""
+""".replace("AUTO_REFRESH_INTERVAL", str(AUTO_REFRESH_SECONDS * 1000))
 
-# After declaring TEMPLATE, we will replace AUTO_REFRESH_INTERVAL with numeric ms value
-TEMPLATE = TEMPLATE.replace("AUTO_REFRESH_INTERVAL",
-                            str(AUTO_REFRESH_SECONDS * 1000))
-
-
-# --- Utilities: load credentials, read sheet or fallback to local excel ---
 
 def load_service_account_credentials():
     """Load service account credentials from env or credentials.json."""
@@ -284,281 +326,70 @@ def load_service_account_credentials():
     return None
 
 
-def read_sheet_to_dataframe(creds):
-    """Read Google Sheet if creds available; otherwise fallback to local Excel."""
-    if creds:
-        try:
-            gc = gspread.authorize(creds)
-            sh = gc.open_by_key(SHEET_ID)
-            ws = sh.get_worksheet(0)
-            rows = ws.get_all_values()
-            if not rows:
-                raise ValueError("Sheet empty")
-            headers = rows[0]
-            data = rows[1:]
-            df = pd.DataFrame(data, columns=headers)
-            logger.info("Loaded sheet rows: %d", len(df))
-            return df
-        except Exception as e:
-            logger.exception("Failed reading Google Sheet: %s", e)
-    # local fallback
+def read_google_sheet(creds, sheet_name):
+    """Read a specific worksheet from Google Sheets."""
     try:
-        if os.path.exists(LOCAL_XLSX_FALLBACK):
-            logger.info("Using local fallback Excel: %s", LOCAL_XLSX_FALLBACK)
-            df = pd.read_excel(LOCAL_XLSX_FALLBACK)
-            return df
-        else:
-            raise FileNotFoundError("No credentials and no local fallback")
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet(sheet_name)
+        rows = ws.get_all_values()
+        if not rows:
+            return pd.DataFrame()
+        headers = rows[0]
+        data = rows[1:]
+        df = pd.DataFrame(data, columns=headers)
+        logger.info(f"Loaded {sheet_name}: {len(df)} rows")
+        return df
     except Exception as e:
-        logger.exception("Failed to read local fallback: %s", e)
-        raise
+        logger.exception(f"Failed reading sheet {sheet_name}: %s", e)
+        return pd.DataFrame()
 
 
-def clean_and_normalize_df(df):
-    """
-    Clean headers, prefer Name column for display name, parse dates and distances,
-    create normalized columns used by the leaderboard logic.
-    """
-    df = df.copy()
+def compute_data(daily_df, team_df, summary_df):
+    """Compute individual athlete scores and team totals."""
 
-    # normalize headers: strip quotes and whitespace and handle duplicates
-    new_cols = []
-    seen = {}
-    for c in df.columns:
-        if isinstance(c, str):
-            h = c.strip().strip('"').strip("'")
-        else:
-            h = str(c)
-        if h in seen:
-            seen[h] += 1
-            h2 = f"{h}__{seen[h]}"
-        else:
-            seen[h] = 0
-            h2 = h
-        new_cols.append(h2)
-    df.columns = new_cols
+    # Clean column names
+    daily_df.columns = [str(c).strip() for c in daily_df.columns]
+    team_df.columns = [str(c).strip() for c in team_df.columns]
+    summary_df.columns = [str(c).strip() for c in summary_df.columns]
 
-    def find_col(cand_list):
-        for cand in cand_list:
-            for col in df.columns:
-                if col.lower().strip() == cand.lower().strip() or cand.lower().strip() in col.lower():
-                    return col
-        return None
+    # Create athlete_id to team mapping
+    team_map = {}
+    for _, row in team_df.iterrows():
+        strava_id = str(row.get('STRAVA_ID', '')).strip()
+        team_id = str(row.get('TEAM_ID', '')).strip()
+        if not team_id:
+            team_id = str(row.get('TEAM', '')).strip()
+        if strava_id and team_id:
+            team_map[strava_id] = team_id
 
-    # PREFER the human-friendly Name column over the Athlete path column
-    col_athlete = find_col(['Name', 'Athlete', 'Athlete Name', 'athlete'])
-    col_activity = find_col(['Activity', 'Activity Name'])
-    col_type = find_col(['Type', 'Activity Type'])
-    col_date = find_col(['Date', 'date'])
-    col_distance = find_col(['Distance', 'distance', 'Dist', 'KM', 'Km'])
-    col_unit = find_col(['Unit', 'unit'])
-    col_athlete_id = find_col(['Athlete ID', 'AthleteID', 'athlete id', 'id'])
+    # Parse daily data
+    daily_df['athlete_id'] = daily_df['Athlete'].astype(str).str.strip()
+    daily_df['athlete_name'] = daily_df['Name'].astype(str).str.strip()
+    daily_df['points'] = pd.to_numeric(daily_df.get(
+        'CalcTotal', 0), errors='coerce').fillna(0)
 
-    # Canonical columns
-    df['__athlete_name'] = df[col_athlete] if col_athlete in df.columns else df.iloc[:, 0]
-    df['__athlete_id'] = df[col_athlete_id] if col_athlete_id in df.columns else df['__athlete_name']
-    df['__activity'] = df[col_activity] if col_activity in df.columns else ''
-    df['__type'] = df[col_type] if col_type in df.columns else ''
-    df['__raw_date'] = df[col_date] if col_date in df.columns else None
-    df['__distance_raw'] = df[col_distance] if col_distance in df.columns else None
-    df['__unit'] = df[col_unit] if col_unit in df.columns else None
+    # Map teams
+    daily_df['team'] = daily_df['athlete_id'].map(team_map).fillna('Unknown')
 
-    # timezone-aware parser: convert timestamps (with offsets) to target tz then extract date
-    TARGET_TZ = pytz.timezone('Asia/Kolkata')
+    # Aggregate by athlete - sum all their points
+    athlete_stats = daily_df.groupby(['athlete_name', 'athlete_id', 'team'])[
+        'points'].sum().reset_index()
+    athlete_stats.columns = ['name', 'athlete_id', 'team', 'points']
+    athlete_list = athlete_stats.to_dict('records')
 
-    def parse_date_val(v):
-        if pd.isna(v):
-            return None
-
-        # If it's already a datetime-like object
-        if isinstance(v, (datetime, pd.Timestamp)):
-            t = pd.to_datetime(v)
-        else:
-            # Let pandas parse the string (handles ISO with +05:30)
-            t = pd.to_datetime(str(v), errors='coerce')
-
-        if pd.isna(t):
-            return None
-
-        # If pandas produced a tz-aware timestamp:
-        try:
-            if getattr(t, 'tz', None) is not None and t.tz is not None:
-                # convert to TARGET_TZ calendar date
-                t_local = t.tz_convert(TARGET_TZ)
-            else:
-                # tz-naive: assume timestamps are already in TARGET_TZ local time
-                # (alternative: localize as UTC then convert if your data is in UTC)
-                t_local = TARGET_TZ.localize(t)
-        except Exception:
-            # last-resort: assume UTC then convert
-            try:
-                t = t.tz_localize('UTC')
-                t_local = t.tz_convert(TARGET_TZ)
-            except Exception:
-                return None
-
-        return t_local.date()
-
-    df['__date'] = df['__raw_date'].apply(parse_date_val)
-
-    # distance parsing and km conversion
-    def parse_distance(row):
-        v = row.get('__distance_raw')
-        if pd.isna(v):
-            return 0.0
-        try:
-            s = str(v).replace(',', '').strip()
-            parts = s.split()
-            num = float(parts[0])
-        except Exception:
-            try:
-                num = float(pd.to_numeric(v, errors='coerce') or 0.0)
-            except Exception:
-                num = 0.0
-        unit = row.get('__unit') or ''
-        unit_s = str(unit).lower()
-        if 'mile' in unit_s or 'mi' in unit_s:
-            return num * 1.60934
-        return float(num)
-
-    df['__km'] = df.apply(parse_distance, axis=1)
-
-    df['__type_norm'] = df['__type'].fillna('').astype(str).str.lower()
-    df['__activity_norm'] = df['__activity'].fillna('').astype(str).str.lower()
-    df['__athlete_id_str'] = df['__athlete_id'].astype(str).str.strip()
-    df['__athlete_name_str'] = df['__athlete_name'].astype(str).str.strip()
-
-    df = df[~(df['__athlete_id_str'].isna() & df['__athlete_name_str'].isna())]
-
-    return df
-
-
-def compute_leaderboards(df, today_date=None):
-    # If no today_date provided, use the latest date present in the data (so we evaluate up to last logged day).
-    if today_date is None:
-        # derive today_date from the data's latest parsed date when available
-        if '__date' in df.columns:
-            try:
-                valid_dates = pd.to_datetime(df['__date'], errors='coerce').dropna().dt.date
-                if not valid_dates.empty:
-                    today_date = valid_dates.max()
-                else:
-                    tz = pytz.timezone(TIMEZONE)
-                    today_date = datetime.now(tz).date()
-            except Exception:
-                tz = pytz.timezone(TIMEZONE)
-                today_date = datetime.now(tz).date()
-        else:
-            tz = pytz.timezone(TIMEZONE)
-            today_date = datetime.now(tz).date()
-
-    id_col = '__athlete_id_str'
-    name_col = '__athlete_name_str'
-    km_col = '__km'
-    date_col = '__date'
-    type_col = '__type_norm'
-    activity_col = '__activity_norm'
-
-    # aggregate per athlete: total, walk, run, ride
-    grouped = df.groupby([id_col, name_col])
-    records = []
-    for (ath_id, ath_name), sub in grouped:
-        total_km = float(sub[km_col].sum())
-        walk_km = float(sub[(sub[type_col].str.contains(
-            'walk', na=False) | sub[activity_col].str.contains('walk', na=False))][km_col].sum())
-        run_km = float(sub[(sub[type_col].str.contains('run|jog', na=False) |
-                       sub[activity_col].str.contains('run|jog', na=False))][km_col].sum())
-        ride_km = float(sub[(sub[type_col].str.contains('ride|cycle|bike', na=False) |
-                        sub[activity_col].str.contains('ride|cycle|bike', na=False))][km_col].sum())
-        records.append({'athlete_id': str(ath_id), 'name': str(
-            ath_name), 'total_km': total_km, 'walk_km': walk_km, 'run_km': run_km, 'ride_km': ride_km})
-
-    agg_df = pd.DataFrame(records)
-    if agg_df.empty:
-        agg_df = pd.DataFrame(
-            columns=['athlete_id', 'name', 'total_km', 'walk_km', 'run_km', 'ride_km'])
-
-    # leaderboards sorted
-    leader_total = agg_df.sort_values(
-        'total_km', ascending=False).to_dict('records')
-    leader_walk = agg_df.sort_values(
-        'walk_km', ascending=False).to_dict('records')
-    leader_run = agg_df.sort_values(
-        'run_km', ascending=False).to_dict('records')
-    leader_ride = agg_df.sort_values(
-        'ride_km', ascending=False).to_dict('records')
-
-    # consistent performers: must meet daily threshold for each day from START_DATE through today_date
-    day_range = (today_date - START_DATE).days + 1
-    required_days = [START_DATE + timedelta(days=i)
-                     for i in range(max(0, day_range))]
-
-    def qualifies_day(subdf, d):
-        # select rows for that exact date (date column stores date objects)
-        day_rows = subdf[subdf[date_col] == d]
-        if day_rows.empty:
-            return False
-
-        # compute km and type for each activity that day
-        # we'll sort by km descending and take top two activities
-        day_rows_sorted = day_rows.sort_values(by=km_col, ascending=False)
-
-        # take top two activities (or 1 if only one)
-        top_two = day_rows_sorted.head(2)
-
-        # sum their kms
-        top_sum = float(top_two[km_col].sum())
-
-        # determine if both top activities are ride-type
-        is_ride_mask = (
-            top_two[type_col].str.contains('ride|cycle|bike', na=False) |
-            top_two[activity_col].str.contains('ride|cycle|bike', na=False)
-        )
-        both_ride = (is_ride_mask.sum() == len(top_two))
-
-        # qualification thresholds:
-        # - if both top activities are ride-type => require >=5.0 km
-        # - otherwise (any walk/run present) => require >=2.0 km
-        if both_ride:
-            return top_sum >= 5.0
-        else:
-            return top_sum >= 2.0
-
-    consistent_list = []
-    for (ath_id, ath_name), sub in grouped:
-        qualifies = True
-        for d in required_days:
-            if not qualifies_day(sub, d):
-                qualifies = False
-                break
-        if qualifies and len(required_days) > 0:
-            consistent_list.append(
-                {'athlete_id': str(ath_id), 'name': str(ath_name)})
-
-    # mark consistent flag on agg_df records
-    agg_df['consistent'] = agg_df.apply(lambda r: any(
-        (r['athlete_id'] == c['athlete_id']) for c in consistent_list), axis=1)
-
-    total_athletes = df['__athlete_id_str'].nunique()
-    days_running = max(0, (today_date - START_DATE).days + 1)
-    consistent_count = len(consistent_list)
-    top_distance_km = float(
-        agg_df['total_km'].max() if not agg_df.empty else 0.0)
+    # Parse team summary data
+    teams_data = []
+    for _, row in summary_df.iterrows():
+        team = str(row.get('TEAM', '')).strip()
+        points = float(pd.to_numeric(
+            row.get('POINT', 0), errors='coerce') or 0)
+        if team:
+            teams_data.append({'team': team, 'points': points})
 
     return {
-        'leaderboards': {
-            'total': [{'athlete_id': r['athlete_id'], 'name': r['name'], 'km': r['total_km'], 'consistent': bool(r.get('consistent', False))} for r in leader_total],
-            'walk': [{'athlete_id': r['athlete_id'], 'name': r['name'], 'walk_km': r['walk_km'], 'consistent': bool(r.get('consistent', False))} for r in leader_walk],
-            'run': [{'athlete_id': r['athlete_id'], 'name': r['name'], 'run_km': r['run_km'], 'consistent': bool(r.get('consistent', False))} for r in leader_run],
-            'ride': [{'athlete_id': r['athlete_id'], 'name': r['name'], 'ride_km': r['ride_km'], 'consistent': bool(r.get('consistent', False))} for r in leader_ride]
-        },
-        'consistent': consistent_list,
-        'summary': {
-            'total_athletes': int(total_athletes),
-            'days_running': int(days_running),
-            'consistent_count': int(consistent_count),
-            'top_distance_km': float(top_distance_km)
-        }
+        'athletes': athlete_list,
+        'teams': teams_data
     }
 
 
@@ -571,16 +402,26 @@ def index():
 def api_data():
     try:
         creds = load_service_account_credentials()
-        df_raw = read_sheet_to_dataframe(creds)
-        df = clean_and_normalize_df(df_raw)
-        results = compute_leaderboards(df)
+        if not creds:
+            return jsonify({'error': 'No credentials available'}), 500
+
+        # Read sheets
+        daily_df = read_google_sheet(creds, 'DAILY-UPDATE')
+        team_df = read_google_sheet(creds, 'TEAM DATA')
+        summary_df = read_google_sheet(creds, 'SUMMARY')
+
+        if daily_df.empty or team_df.empty or summary_df.empty:
+            return jsonify({'error': 'One or more sheets are empty'}), 500
+
+        results = compute_data(daily_df, team_df, summary_df)
+
         tz = pytz.timezone(TIMEZONE)
         payload = {
-            'leaderboards': results['leaderboards'],
-            'consistent': results['consistent'],
-            'summary': results['summary'],
+            'athletes': results['athletes'],
+            'teams': results['teams'],
             'loaded_at': datetime.now(tz).isoformat()
         }
+
         return jsonify(payload)
     except Exception as e:
         logger.exception("Failed to build API data: %s", e)
@@ -588,5 +429,4 @@ def api_data():
 
 
 if __name__ == '__main__':
-    # for local debugging
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
