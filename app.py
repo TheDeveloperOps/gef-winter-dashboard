@@ -36,17 +36,17 @@ MAIN_TEMPLATE = """<!doctype html>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     html,body{height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto;font-size:16px}
-    body{background:linear-gradient(135deg,#0f172a,#1e293b);color:#e2e8f0;padding:16px}
+    body{background:linear-gradient(135deg,#0f172a,#1e293b);color:#e2e8f0;padding:12px 16px}
     .container{max-width:1400px;margin:0 auto}
-    .header{text-align:center;margin-bottom:20px}
-    h1{font-size:24px;font-weight:800;background:linear-gradient(90deg,#10b981,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}
-    .subtitle{color:#94a3b8;font-size:14px;font-weight:600}
+    .header{text-align:center;margin-bottom:24px;padding:16px 0}
+    h1{font-size:28px;font-weight:800;background:linear-gradient(90deg,#10b981,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px;line-height:1.2}
+    .subtitle{color:#94a3b8;font-size:15px;font-weight:600}
     
-    .card{background:rgba(30,41,59,0.7);backdrop-filter:blur(10px);border:1px solid rgba(148,163,184,0.15);border-radius:12px;padding:20px;margin:16px 0;box-shadow:0 10px 40px rgba(0,0,0,0.3)}
-    .section-title{font-size:18px;font-weight:800;color:#10b981;margin-bottom:14px;padding-bottom:8px;border-bottom:2px solid rgba(16,185,129,0.4);display:flex;align-items:center;gap:8px}
+    .card{background:rgba(30,41,59,0.7);backdrop-filter:blur(10px);border:1px solid rgba(148,163,184,0.15);border-radius:12px;padding:20px;margin:20px 0;box-shadow:0 10px 40px rgba(0,0,0,0.3)}
+    .section-title{font-size:20px;font-weight:800;color:#10b981;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid rgba(16,185,129,0.4);display:flex;align-items:center;gap:10px;line-height:1.3}
     
-    .chart-container{background:rgba(15,23,42,0.7);padding:16px;border-radius:10px;margin-top:12px;min-height:350px;cursor:pointer}
-    canvas{max-height:320px}
+    .chart-container{background:rgba(15,23,42,0.7);padding:16px;border-radius:10px;margin-top:12px;min-height:500px;cursor:pointer}
+    canvas{max-height:480px;width:100%!important;height:480px!important}
     
     /* Leaderboards Grid */
     .leaderboards-grid{display:grid;grid-template-columns:1fr;gap:16px;margin:20px 0}
@@ -112,7 +112,7 @@ MAIN_TEMPLATE = """<!doctype html>
       .subtitle{font-size:16px}
       .leaderboards-grid{grid-template-columns:repeat(2,1fr);gap:20px}
       .chart-container{min-height:420px;padding:20px}
-      canvas{max-height:380px}
+      canvas{max-height:400px!important;height:400px!important}
       .card{padding:28px}
     }
     
@@ -128,6 +128,9 @@ MAIN_TEMPLATE = """<!doctype html>
     <div class="header">
       <h1>🏃 GEF Winter Challenge</h1>
       <p class="subtitle">Team Performance & Leaderboards</p>
+      <p style="color:#64748b;font-size:13px;font-weight:600;margin-top:8px">
+        Sheet Updated: <span id="sheetUpdated" style="color:#10b981;font-weight:700">—</span>
+      </p>
     </div>
 
     <!-- Team Chart -->
@@ -135,6 +138,10 @@ MAIN_TEMPLATE = """<!doctype html>
       <div class="section-title">
         <span>🏆</span>
         <span>Team Points - Click Bar for Details</span>
+      </div>
+      <div style="background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);border-radius:8px;padding:12px;margin-bottom:12px;text-align:center">
+        <span style="font-size:14px;font-weight:700;color:#10b981">💡 Tip:</span>
+        <span style="font-size:14px;font-weight:600;color:#e2e8f0"> Tap any bar to see team members & details</span>
       </div>
       <div class="chart-container">
         <canvas id="teamChart"></canvas>
@@ -224,6 +231,7 @@ MAIN_TEMPLATE = """<!doctype html>
         renderLeaderboard('menRideList', leaderboards.men_ride, 'searchMenRide');
         renderLeaderboard('womenRideList', leaderboards.women_ride, 'searchWomenRide');
         
+        document.getElementById('sheetUpdated').textContent = data.sheet_updated || '—';
         document.getElementById('lastUpdated').textContent = new Date(data.loaded_at).toLocaleString();
       }catch(e){
         console.error('Failed to load data:', e);
@@ -247,12 +255,13 @@ MAIN_TEMPLATE = """<!doctype html>
             data: points,
             backgroundColor: 'rgba(16, 185, 129, 0.8)',
             borderColor: 'rgba(16, 185, 129, 1)',
-            borderWidth: 2
+            borderWidth: 2,
+            teamNames: labels
           }]
         },
         options: {
           responsive: true,
-          maintainAspectRatio: true,
+          maintainAspectRatio: false,
           onClick: (e, activeEls) => {
             if(activeEls.length > 0){
               const index = activeEls[0].index;
@@ -267,23 +276,35 @@ MAIN_TEMPLATE = """<!doctype html>
               }
             },
             datalabels: {
-              display: true,
+              display: (context) => true,
+              font: (context) => {
+                return {
+                  weight: 'bold',
+                  size: window.innerWidth < 768 ? 11 : 12
+                };
+              },
+              color: 'white',
+              formatter: (value, context) => {
+                const teamName = context.chart.data.datasets[0].teamNames[context.dataIndex];
+                const points = value.toFixed(1);
+                return [teamName, points];
+              },
+              rotation: -90,
               anchor: 'center',
               align: 'center',
-              rotation: -90,
-              color: 'white',
-              font: {weight: 'bold', size: 13},
-              formatter: (value) => value.toFixed(1)
+              offset: 0,
+              textAlign: 'center',
+              padding: 4
             }
           },
           scales: {
             x: {
-              ticks: {color: '#94a3b8', font: {size: 13, weight: 'bold'}},
+              ticks: {color: '#94a3b8', font: {size: window.innerWidth < 768 ? 14 : 13, weight: 'bold'}},
               grid: {display: false}
             },
             y: {
-              title: {display: true, text: 'Points', color: '#94a3b8', font: {size: 13, weight: 'bold'}},
-              ticks: {color: '#94a3b8', font: {size: 12}},
+              title: {display: true, text: 'Points', color: '#94a3b8', font: {size: window.innerWidth < 768 ? 15 : 13, weight: 'bold'}},
+              ticks: {color: '#94a3b8', font: {size: window.innerWidth < 768 ? 14 : 12}},
               grid: {color: 'rgba(148,163,184,0.1)'}
             }
           }
@@ -295,7 +316,8 @@ MAIN_TEMPLATE = """<!doctype html>
       const container = document.getElementById(listId);
       const searchBox = document.getElementById(searchId);
       
-      let allAthletes = athletes;
+      // Add original rank to each athlete
+      let allAthletes = athletes.map((a, i) => ({...a, originalRank: i + 1}));
       
       function render(filtered){
         if(!filtered || filtered.length === 0){
@@ -305,9 +327,9 @@ MAIN_TEMPLATE = """<!doctype html>
         
         let html = '';
         filtered.forEach((a, i) => {
-          const rankClass = i === 0 ? 'rank-1' : i === 1 ? 'rank-2' : i === 2 ? 'rank-3' : '';
+          const rankClass = a.originalRank === 1 ? 'rank-1' : a.originalRank === 2 ? 'rank-2' : a.originalRank === 3 ? 'rank-3' : '';
           html += '<div class="athlete-item ' + rankClass + '">';
-          html += '<span class="athlete-rank">' + (i + 1) + '</span>';
+          html += '<span class="athlete-rank">' + a.originalRank + '</span>';
           html += '<span class="athlete-name">' + a.name + '</span>';
           html += '<span class="athlete-points">' + a.points.toFixed(1) + '</span>';
           html += '</div>';
@@ -549,6 +571,17 @@ def compute_main_data(daily_df, summary_df, team_df):
     summary_df.columns = [str(c).strip() for c in summary_df.columns]
     team_df.columns = [str(c).strip() for c in team_df.columns]
 
+    # Find most recent date in the sheet
+    sheet_updated = "Unknown"
+    try:
+        daily_df['date_extract_parsed'] = pd.to_datetime(
+            daily_df['DATE_EXTRACT'], errors='coerce')
+        max_date = daily_df['date_extract_parsed'].max()
+        if pd.notna(max_date):
+            sheet_updated = max_date.strftime('%d %b %Y')
+    except Exception as e:
+        logger.warning(f"Could not parse sheet update date: {e}")
+
     # Create gender map from TEAM DATA
     gender_map = {}
     for _, row in team_df.iterrows():
@@ -649,7 +682,8 @@ def compute_main_data(daily_df, summary_df, team_df):
             'women_run': women_run_list,
             'men_ride': men_ride_list,
             'women_ride': women_ride_list
-        }
+        },
+        'sheet_updated': sheet_updated
     }
 
 
@@ -776,6 +810,7 @@ def api_data():
             'athletes': results['athletes'],
             'teams': results['teams'],
             'leaderboards': results['leaderboards'],
+            'sheet_updated': results['sheet_updated'],
             'loaded_at': datetime.now(tz).isoformat()
         }
         return jsonify(payload)
