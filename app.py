@@ -1,5 +1,6 @@
 """
-GEF Winter Challenge Dashboard - Final Version with TEAM DATA Lookup
+GEF Winter Challenge Dashboard - Fixed Version
+- Removes #N/A teams from chart completely
 - Reads SOURCE sheet for activity data (with ID column)
 - Reads TEAM DATA sheet for gender information (STRAVA_ID and GENDER columns)
 - Matches IDs to get accurate gender for leaderboards
@@ -684,9 +685,13 @@ def compute_main_data(source_df, team_data_df):
     source_df['total_points'] = pd.to_numeric(
         source_df.get('Total', 0), errors='coerce').fillna(0)
 
-    # Filter out invalid teams
-    source_df = source_df[source_df['team'] != 'nan']
-    source_df = source_df[source_df['team'] != '']
+    # CRITICAL FIX: Filter out invalid teams BEFORE any processing
+    # This ensures #N/A teams never make it into the teams chart
+    invalid_teams = ['NAN', 'N/A', 'NA', 'NONE', '#N/A', '', 'NULL']
+    source_df = source_df[
+        (source_df['team'].notna()) &
+        (~source_df['team'].str.upper().isin(invalid_teams))
+    ].copy()
 
     # Overall athletes (aggregate by athlete)
     athlete_stats = source_df.groupby(['athlete_name', 'athlete_id', 'team', 'gender']).agg({
@@ -738,15 +743,15 @@ def compute_main_data(source_df, team_data_df):
     women_ride_list = [{'name': row['athlete_name'], 'points': row['ride_points']}
                        for _, row in women_ride.iterrows()]
 
-    # Teams
+    # Teams - now using already filtered data
     team_totals = source_df.groupby('team')['total_points'].sum().reset_index()
     teams_data = []
     for _, row in team_totals.iterrows():
-        team = row['team']
-        points = row['total_points']
-        if team and team != 'nan':
-            teams_data.append({'team': team, 'points': float(points)})
+        teams_data.append(
+            {'team': row['team'], 'points': float(row['total_points'])})
 
+    logger.info(
+        f"Created {len(teams_data)} valid teams (no #N/A or invalid teams)")
     logger.info(
         f"Gender distribution - Men Run/Walk: {len(men_run_list)}, Women Run/Walk: {len(women_run_list)}, Men Ride: {len(men_ride_list)}, Women Ride: {len(women_ride_list)}")
 
