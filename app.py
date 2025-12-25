@@ -1,6 +1,9 @@
 """
-GEF Winter Challenge Dashboard - Complete with Gender Leaderboards
-- Mobile-first design with larger fonts for aged users
+GEF Winter Challenge Dashboard - Final Version with TEAM DATA Lookup
+- Reads SOURCE sheet for activity data (with ID column)
+- Reads TEAM DATA sheet for gender information (STRAVA_ID and GENDER columns)
+- Matches IDs to get accurate gender for leaderboards
+- Mobile-first design with larger fonts
 - Team bar chart
 - 4 Gender-based leaderboards (Men/Women Run-Walk/Ride)
 - Individual activity search
@@ -549,6 +552,7 @@ def load_service_account_credentials():
 
 
 def read_google_sheet(creds, sheet_name):
+    """Read data from a Google Sheet"""
     try:
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(SHEET_ID)
@@ -566,76 +570,153 @@ def read_google_sheet(creds, sheet_name):
         return pd.DataFrame()
 
 
-def compute_main_data(daily_df, summary_df, team_df):
-    daily_df.columns = [str(c).strip() for c in daily_df.columns]
-    summary_df.columns = [str(c).strip() for c in summary_df.columns]
-    team_df.columns = [str(c).strip() for c in team_df.columns]
+def create_gender_map(team_data_df):
+    """
+    Create a dictionary mapping STRAVA_ID to GENDER from TEAM DATA sheet
+
+    TEAM DATA columns:
+    - STRAVA_ID (Column D): athlete IDs like 122561065
+    - GENDER (Column G): M, F, or Sr_M format
+    """
+    gender_map = {}
+
+    if team_data_df.empty:
+        logger.warning("TEAM DATA sheet is empty")
+        return gender_map
+
+    # Clean column names
+    team_data_df.columns = [str(c).strip() for c in team_data_df.columns]
+
+    # Find STRAVA_ID and GENDER columns
+    strava_id_col = None
+    gender_col = None
+
+    for col in team_data_df.columns:
+        col_upper = col.upper()
+        if 'STRAVA' in col_upper and 'ID' in col_upper:
+            strava_id_col = col
+        if 'GENDER' in col_upper:
+            gender_col = col
+
+    if not strava_id_col or not gender_col:
+        logger.error(
+            f"Could not find STRAVA_ID or GENDER columns. Found: {list(team_data_df.columns)}")
+        return gender_map
+
+    logger.info(f"Using columns: {strava_id_col} and {gender_col}")
+
+    # Build the gender map
+    for _, row in team_data_df.iterrows():
+        strava_id = str(row.get(strava_id_col, '')).strip()
+        gender = str(row.get(gender_col, '')).strip().upper()
+
+        if not strava_id or strava_id == 'nan':
+            continue
+
+        # Handle Sr_M, Sr_F formats - extract just M or F
+        if gender.startswith('SR'):
+            gender = gender.replace('SR_', '').replace('SR', '')
+
+        # Normalize to M or F
+        if gender in ['M', 'MALE']:
+            gender_map[strava_id] = 'M'
+        elif gender in ['F', 'FEMALE']:
+            gender_map[strava_id] = 'F'
+        else:
+            gender_map[strava_id] = 'M'  # Default to M if unclear
+
+    logger.info(f"Created gender map with {len(gender_map)} entries")
+    return gender_map
+
+
+def compute_main_data(source_df, team_data_df):
+    """
+    Compute dashboard data from SOURCE sheet with gender lookup from TEAM DATA
+
+    SOURCE sheet columns:
+    - Athlete: /athletes/ID format (or use ID column directly)
+    - ID (Column W): athlete IDs extracted from Athlete column
+    - Name: athlete name  
+    - Date or Day: activity date
+    - Run, Walk, ride: point values
+    - Total: total points
+    - Team: team identifier
+    """
+
+    source_df.columns = [str(c).strip() for c in source_df.columns]
 
     # Find most recent date in the sheet
     sheet_updated = "Unknown"
     try:
-        daily_df['date_extract_parsed'] = pd.to_datetime(
-            daily_df['DATE_EXTRACT'], errors='coerce')
-        max_date = daily_df['date_extract_parsed'].max()
+        date_col = 'Day' if 'Day' in source_df.columns else 'Date'
+        source_df['date_parsed'] = pd.to_datetime(
+            source_df[date_col], errors='coerce')
+        max_date = source_df['date_parsed'].max()
         if pd.notna(max_date):
             sheet_updated = max_date.strftime('%d %b %Y')
     except Exception as e:
         logger.warning(f"Could not parse sheet update date: {e}")
 
     # Create gender map from TEAM DATA
-    gender_map = {}
-    for _, row in team_df.iterrows():
-        strava_id = str(row.get('STRAVA_ID', '')).strip()
-        gender = str(row.get('GENDER', '')).strip().upper()
-        # Handle srM, srF, etc - just take first letter after 'sr'
-        if gender.startswith('SR'):
-            gender = gender[2] if len(gender) > 2 else gender
-        gender = 'M' if gender == 'M' else 'F' if gender == 'F' else 'U'
-        if strava_id:
-            gender_map[strava_id] = gender
+    gender_map = create_gender_map(team_data_df)
 
-    daily_df['athlete_id'] = daily_df['ID'].astype(str).str.strip()
-    daily_df['athlete_name'] = daily_df['Name'].astype(str).str.strip()
-    daily_df['team'] = daily_df['TEAM_ID'].astype(str).str.strip()
-    daily_df['points'] = pd.to_numeric(daily_df.get(
-        'CalcTotal', 0), errors='coerce').fillna(0)
-    daily_df['calc_run'] = pd.to_numeric(
-        daily_df.get('CalcRun', 0), errors='coerce').fillna(0)
-    daily_df['calc_walk'] = pd.to_numeric(
-        daily_df.get('CalcWalk', 0), errors='coerce').fillna(0)
-    daily_df['calc_ride'] = pd.to_numeric(
-        daily_df.get('CalcRide', 0), errors='coerce').fillna(0)
-    daily_df['gender'] = daily_df['athlete_id'].map(gender_map).fillna('U')
-    daily_df = daily_df[daily_df['team'] != 'nan']
+    # Get athlete ID - try ID column first, then extract from Athlete column
+    if 'ID' in source_df.columns:
+        source_df['athlete_id'] = source_df['ID'].astype(str).str.strip()
+    else:
+        # Extract from /athletes/ID format
+        source_df['athlete_id'] = source_df['Athlete'].astype(
+            str).str.extract(r'/athletes/(\d+)')[0]
 
-    # Overall athletes
-    athlete_stats = daily_df.groupby(['athlete_name', 'athlete_id', 'team'])[
-        'points'].sum().reset_index()
-    athlete_stats.columns = ['name', 'athlete_id', 'team', 'points']
+    source_df['athlete_name'] = source_df['Name'].astype(str).str.strip()
+    source_df['team'] = source_df['Team'].astype(str).str.strip()
+
+    # Lookup gender from gender_map
+    source_df['gender'] = source_df['athlete_id'].map(gender_map).fillna('M')
+
+    # Convert point columns to numeric
+    source_df['run_points'] = pd.to_numeric(
+        source_df.get('Run', 0), errors='coerce').fillna(0)
+    source_df['walk_points'] = pd.to_numeric(
+        source_df.get('Walk', 0), errors='coerce').fillna(0)
+    source_df['ride_points'] = pd.to_numeric(
+        source_df.get('ride', 0), errors='coerce').fillna(0)
+    source_df['total_points'] = pd.to_numeric(
+        source_df.get('Total', 0), errors='coerce').fillna(0)
+
+    # Filter out invalid teams
+    source_df = source_df[source_df['team'] != 'nan']
+    source_df = source_df[source_df['team'] != '']
+
+    # Overall athletes (aggregate by athlete)
+    athlete_stats = source_df.groupby(['athlete_name', 'athlete_id', 'team', 'gender']).agg({
+        'total_points': 'sum'
+    }).reset_index()
+    athlete_stats.columns = ['name', 'athlete_id', 'team', 'gender', 'points']
     athlete_list = athlete_stats.to_dict('records')
 
     # Gender-based leaderboards
     # Men Run/Walk
-    men_df = daily_df[daily_df['gender'] == 'M'].copy()
+    men_df = source_df[source_df['gender'] == 'M'].copy()
     men_run_walk = men_df.groupby(['athlete_name', 'athlete_id']).agg({
-        'calc_run': 'sum',
-        'calc_walk': 'sum'
+        'run_points': 'sum',
+        'walk_points': 'sum'
     }).reset_index()
-    men_run_walk['points'] = men_run_walk['calc_run'] + \
-        men_run_walk['calc_walk']
+    men_run_walk['points'] = men_run_walk['run_points'] + \
+        men_run_walk['walk_points']
     men_run_walk = men_run_walk[men_run_walk['points']
                                 > 0].sort_values('points', ascending=False)
     men_run_list = [{'name': row['athlete_name'], 'points': row['points']}
                     for _, row in men_run_walk.iterrows()]
 
     # Women Run/Walk
-    women_df = daily_df[daily_df['gender'] == 'F'].copy()
+    women_df = source_df[source_df['gender'] == 'F'].copy()
     women_run_walk = women_df.groupby(['athlete_name', 'athlete_id']).agg({
-        'calc_run': 'sum',
-        'calc_walk': 'sum'
+        'run_points': 'sum',
+        'walk_points': 'sum'
     }).reset_index()
-    women_run_walk['points'] = women_run_walk['calc_run'] + \
-        women_run_walk['calc_walk']
+    women_run_walk['points'] = women_run_walk['run_points'] + \
+        women_run_walk['walk_points']
     women_run_walk = women_run_walk[women_run_walk['points'] > 0].sort_values(
         'points', ascending=False)
     women_run_list = [{'name': row['athlete_name'], 'points': row['points']}
@@ -643,36 +724,31 @@ def compute_main_data(daily_df, summary_df, team_df):
 
     # Men Ride
     men_ride = men_df.groupby(['athlete_name', 'athlete_id'])[
-        'calc_ride'].sum().reset_index()
-    men_ride = men_ride[men_ride['calc_ride'] >
-                        0].sort_values('calc_ride', ascending=False)
-    men_ride_list = [{'name': row['athlete_name'], 'points': row['calc_ride']}
+        'ride_points'].sum().reset_index()
+    men_ride = men_ride[men_ride['ride_points'] >
+                        0].sort_values('ride_points', ascending=False)
+    men_ride_list = [{'name': row['athlete_name'], 'points': row['ride_points']}
                      for _, row in men_ride.iterrows()]
 
     # Women Ride
     women_ride = women_df.groupby(['athlete_name', 'athlete_id'])[
-        'calc_ride'].sum().reset_index()
-    women_ride = women_ride[women_ride['calc_ride'] >
-                            0].sort_values('calc_ride', ascending=False)
-    women_ride_list = [{'name': row['athlete_name'], 'points': row['calc_ride']}
+        'ride_points'].sum().reset_index()
+    women_ride = women_ride[women_ride['ride_points'] >
+                            0].sort_values('ride_points', ascending=False)
+    women_ride_list = [{'name': row['athlete_name'], 'points': row['ride_points']}
                        for _, row in women_ride.iterrows()]
 
     # Teams
+    team_totals = source_df.groupby('team')['total_points'].sum().reset_index()
     teams_data = []
-    for _, row in summary_df.iterrows():
-        team = str(row.get('TEAM', row.get('TEAM ', ''))).strip()
-        points = float(pd.to_numeric(
-            row.get('POINT', 0), errors='coerce') or 0)
+    for _, row in team_totals.iterrows():
+        team = row['team']
+        points = row['total_points']
         if team and team != 'nan':
-            teams_data.append({'team': team, 'points': points})
+            teams_data.append({'team': team, 'points': float(points)})
 
-    if len(teams_data) == 0:
-        team_totals = daily_df.groupby('team')['points'].sum().reset_index()
-        for _, row in team_totals.iterrows():
-            team = row['team']
-            points = row['points']
-            if team and team != 'nan':
-                teams_data.append({'team': team, 'points': float(points)})
+    logger.info(
+        f"Gender distribution - Men Run/Walk: {len(men_run_list)}, Women Run/Walk: {len(women_run_list)}, Men Ride: {len(men_ride_list)}, Women Ride: {len(women_ride_list)}")
 
     return {
         'athletes': athlete_list,
@@ -687,52 +763,73 @@ def compute_main_data(daily_df, summary_df, team_df):
     }
 
 
-def compute_team_details(daily_df, team_id):
-    daily_df.columns = [str(c).strip() for c in daily_df.columns]
+def compute_team_details(source_df, team_id):
+    """Compute team member details from SOURCE sheet"""
+    source_df.columns = [str(c).strip() for c in source_df.columns]
 
-    daily_df['athlete_id'] = daily_df['ID'].astype(str).str.strip()
-    daily_df['athlete_name'] = daily_df['Name'].astype(str).str.strip()
-    daily_df['team'] = daily_df['TEAM_ID'].astype(str).str.strip()
-    daily_df['calc_run'] = pd.to_numeric(
-        daily_df.get('CalcRun', 0), errors='coerce').fillna(0)
-    daily_df['calc_walk'] = pd.to_numeric(
-        daily_df.get('CalcWalk', 0), errors='coerce').fillna(0)
-    daily_df['calc_ride'] = pd.to_numeric(
-        daily_df.get('CalcRide', 0), errors='coerce').fillna(0)
-    daily_df['calc_total'] = pd.to_numeric(
-        daily_df.get('CalcTotal', 0), errors='coerce').fillna(0)
+    # Get athlete ID
+    if 'ID' in source_df.columns:
+        source_df['athlete_id'] = source_df['ID'].astype(str).str.strip()
+    else:
+        source_df['athlete_id'] = source_df['Athlete'].astype(
+            str).str.extract(r'/athletes/(\d+)')[0]
 
-    team_df = daily_df[daily_df['team'] == team_id].copy()
+    source_df['athlete_name'] = source_df['Name'].astype(str).str.strip()
+    source_df['team'] = source_df['Team'].astype(str).str.strip()
+    source_df['run_points'] = pd.to_numeric(
+        source_df.get('Run', 0), errors='coerce').fillna(0)
+    source_df['walk_points'] = pd.to_numeric(
+        source_df.get('Walk', 0), errors='coerce').fillna(0)
+    source_df['ride_points'] = pd.to_numeric(
+        source_df.get('ride', 0), errors='coerce').fillna(0)
+    source_df['total_points'] = pd.to_numeric(
+        source_df.get('Total', 0), errors='coerce').fillna(0)
+
+    team_df = source_df[source_df['team'] == team_id].copy()
     if team_df.empty:
         return []
 
     members = []
     for athlete_id, group in team_df.groupby('athlete_id'):
         name = group['athlete_name'].iloc[0]
-        run_walk = group['calc_run'].sum() + group['calc_walk'].sum()
-        ride = group['calc_ride'].sum()
-        total = group['calc_total'].sum()
-        members.append({'name': name, 'run_walk_points': f"{run_walk:.1f}",
-                       'ride_points': f"{ride:.1f}", 'total_points': f"{total:.1f}"})
+        run_walk = group['run_points'].sum() + group['walk_points'].sum()
+        ride = group['ride_points'].sum()
+        total = group['total_points'].sum()
+        members.append({
+            'name': name,
+            'run_walk_points': f"{run_walk:.1f}",
+            'ride_points': f"{ride:.1f}",
+            'total_points': f"{total:.1f}"
+        })
 
     members.sort(key=lambda x: x['name'])
     return members
 
 
-def compute_athlete_activities(daily_df, athlete_id):
-    daily_df.columns = [str(c).strip() for c in daily_df.columns]
+def compute_athlete_activities(source_df, athlete_id):
+    """Compute individual athlete activity details from SOURCE sheet"""
+    source_df.columns = [str(c).strip() for c in source_df.columns]
 
-    daily_df['athlete_id'] = daily_df['ID'].astype(str).str.strip()
-    daily_df['date_extract'] = pd.to_datetime(
-        daily_df['DATE_EXTRACT'], errors='coerce')
-    daily_df['calc_run'] = pd.to_numeric(
-        daily_df.get('CalcRun', 0), errors='coerce').fillna(0)
-    daily_df['calc_walk'] = pd.to_numeric(
-        daily_df.get('CalcWalk', 0), errors='coerce').fillna(0)
-    daily_df['calc_ride'] = pd.to_numeric(
-        daily_df.get('CalcRide', 0), errors='coerce').fillna(0)
+    # Get athlete ID
+    if 'ID' in source_df.columns:
+        source_df['athlete_id'] = source_df['ID'].astype(str).str.strip()
+    else:
+        source_df['athlete_id'] = source_df['Athlete'].astype(
+            str).str.extract(r'/athletes/(\d+)')[0]
 
-    athlete_df = daily_df[daily_df['athlete_id'] == athlete_id].copy()
+    # Use 'Day' column if available, otherwise 'Date'
+    date_col = 'Day' if 'Day' in source_df.columns else 'Date'
+    source_df['date_parsed'] = pd.to_datetime(
+        source_df[date_col], errors='coerce')
+
+    source_df['run_points'] = pd.to_numeric(
+        source_df.get('Run', 0), errors='coerce').fillna(0)
+    source_df['walk_points'] = pd.to_numeric(
+        source_df.get('Walk', 0), errors='coerce').fillna(0)
+    source_df['ride_points'] = pd.to_numeric(
+        source_df.get('ride', 0), errors='coerce').fillna(0)
+
+    athlete_df = source_df[source_df['athlete_id'] == athlete_id].copy()
     if athlete_df.empty:
         return {'dates': [], 'daily_activities': []}
 
@@ -740,7 +837,7 @@ def compute_athlete_activities(daily_df, athlete_id):
     date_range = pd.date_range(start=START_DATE, end=today, freq='D')
     date_labels = [d.strftime('%d/%m') for d in date_range]
 
-    athlete_df['date_label'] = athlete_df['date_extract'].dt.strftime('%d/%m')
+    athlete_df['date_label'] = athlete_df['date_parsed'].dt.strftime('%d/%m')
 
     daily_run = {}
     daily_walk = {}
@@ -750,11 +847,11 @@ def compute_athlete_activities(daily_df, athlete_id):
         date_label = row['date_label']
         if pd.notna(date_label):
             daily_run[date_label] = daily_run.get(
-                date_label, 0) + row['calc_run']
+                date_label, 0) + row['run_points']
             daily_walk[date_label] = daily_walk.get(
-                date_label, 0) + row['calc_walk']
+                date_label, 0) + row['walk_points']
             daily_ride[date_label] = daily_ride.get(
-                date_label, 0) + row['calc_ride']
+                date_label, 0) + row['ride_points']
 
     activities = []
 
@@ -763,24 +860,36 @@ def compute_athlete_activities(daily_df, athlete_id):
             d, 0) > 0 else '-' for d in date_labels}
         run_total = sum(v for v in run_values.values() if v != '-')
         run_active = sum(1 for v in run_values.values() if v != '-')
-        activities.append({'type': 'Run', 'values': run_values,
-                          'total': run_total, 'active_days': run_active})
+        activities.append({
+            'type': 'Run',
+            'values': run_values,
+            'total': run_total,
+            'active_days': run_active
+        })
 
     if any(v > 0 for v in daily_walk.values()):
         walk_values = {d: daily_walk.get(d, 0) if daily_walk.get(
             d, 0) > 0 else '-' for d in date_labels}
         walk_total = sum(v for v in walk_values.values() if v != '-')
         walk_active = sum(1 for v in walk_values.values() if v != '-')
-        activities.append({'type': 'Walk', 'values': walk_values,
-                          'total': walk_total, 'active_days': walk_active})
+        activities.append({
+            'type': 'Walk',
+            'values': walk_values,
+            'total': walk_total,
+            'active_days': walk_active
+        })
 
     if any(v > 0 for v in daily_ride.values()):
         ride_values = {d: daily_ride.get(d, 0) if daily_ride.get(
             d, 0) > 0 else '-' for d in date_labels}
         ride_total = sum(v for v in ride_values.values() if v != '-')
         ride_active = sum(1 for v in ride_values.values() if v != '-')
-        activities.append({'type': 'Ride', 'values': ride_values,
-                          'total': ride_total, 'active_days': ride_active})
+        activities.append({
+            'type': 'Ride',
+            'values': ride_values,
+            'total': ride_total,
+            'active_days': ride_active
+        })
 
     return {'dates': date_labels, 'daily_activities': activities}
 
@@ -797,14 +906,18 @@ def api_data():
         if not creds:
             return jsonify({'error': 'No credentials available'}), 500
 
-        daily_df = read_google_sheet(creds, 'DAILY-UPDATE')
-        summary_df = read_google_sheet(creds, 'SUMMARY')
-        team_df = read_google_sheet(creds, 'TEAM DATA')
+        # Read both sheets
+        source_df = read_google_sheet(creds, 'SOURCE')
+        team_data_df = read_google_sheet(creds, 'TEAM DATA')
 
-        if daily_df.empty or summary_df.empty or team_df.empty:
-            return jsonify({'error': 'Sheets are empty'}), 500
+        if source_df.empty:
+            return jsonify({'error': 'SOURCE sheet is empty'}), 500
 
-        results = compute_main_data(daily_df, summary_df, team_df)
+        if team_data_df.empty:
+            logger.warning(
+                "TEAM DATA sheet is empty - gender detection may be inaccurate")
+
+        results = compute_main_data(source_df, team_data_df)
         tz = pytz.timezone(TIMEZONE)
         payload = {
             'athletes': results['athletes'],
@@ -826,18 +939,23 @@ def team_detail(team_id):
         if not creds:
             return "No credentials available", 500
 
-        daily_df = read_google_sheet(creds, 'DAILY-UPDATE')
-        if daily_df.empty:
+        source_df = read_google_sheet(creds, 'SOURCE')
+        if source_df.empty:
             return "No data available", 500
 
-        members = compute_team_details(daily_df, team_id)
+        members = compute_team_details(source_df, team_id)
         total_points = sum(float(m['total_points']) for m in members)
         tz = pytz.timezone(TIMEZONE)
         updated_at = datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')
 
-        return render_template_string(TEAM_TEMPLATE, team_id=team_id, members=members,
-                                      member_count=len(members), total_points=f"{total_points:.1f}",
-                                      updated_at=updated_at)
+        return render_template_string(
+            TEAM_TEMPLATE,
+            team_id=team_id,
+            members=members,
+            member_count=len(members),
+            total_points=f"{total_points:.1f}",
+            updated_at=updated_at
+        )
     except Exception as e:
         logger.exception("Failed to load team details: %s", e)
         return f"Error: {str(e)}", 500
@@ -850,11 +968,11 @@ def athlete_activities(athlete_id):
         if not creds:
             return jsonify({'error': 'No credentials available'}), 500
 
-        daily_df = read_google_sheet(creds, 'DAILY-UPDATE')
-        if daily_df.empty:
+        source_df = read_google_sheet(creds, 'SOURCE')
+        if source_df.empty:
             return jsonify({'error': 'No data available'}), 500
 
-        result = compute_athlete_activities(daily_df, athlete_id)
+        result = compute_athlete_activities(source_df, athlete_id)
         return jsonify(result)
     except Exception as e:
         logger.exception("Failed to load athlete activities: %s", e)
